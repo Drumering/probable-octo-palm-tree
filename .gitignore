@@ -1,0 +1,16 @@
+# python
+*.py[cod]
+__pycache__/
+
+# environments
+.env
+.venv
+env/
+venv/
+
+# IDEs
+.vscode/
+
+# Secrets
+credentials.json
+token.json
