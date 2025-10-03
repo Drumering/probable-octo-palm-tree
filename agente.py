@@ -79,9 +79,9 @@ def analisar_e_decidir_acao_com_gemini(texto: str) -> dict | None:
     
     prompt = (
         f"A data atual é {today_date}. Analise o pedido do usuário: '{texto}'. "
-        "DECIDA se a intenção é 'agendar' ou 'consultar'. "
+        "DECIDA se a intenção é 'agendar', 'consultar' ou 'verificar'. "
         "Se a intenção for 'consultar', extraia APENAS o assunto principal do evento (ex: 'almoço', 'reunião'). "
-        "Se a intenção for 'agendar', converta a data para YYYY-MM-DD. "
+        "Se a intenção for 'agendar' ou 'verificar', converta a data para YYYY-MM-DD. "
         "Sua resposta DEVE ser um JSON que inclui o campo 'action'."
     )
     
@@ -94,7 +94,7 @@ def analisar_e_decidir_acao_com_gemini(texto: str) -> dict | None:
                 response_schema=types.Schema(
                     type=types.Type.OBJECT,
                     properties={
-                        'action': types.Schema(type=types.Type.STRING, description='A ação principal: "agendar" ou "consultar".'),
+                        'action': types.Schema(type=types.Type.STRING, description='A ação principal: "agendar", "consultar" ou "verificar".'),
                         'agendamento': AGENDAMENTO_SCHEMA,
                         'consulta': types.Schema(type=types.Type.STRING, description='A palavra-chave para consulta, se a ação for "consultar".')
                     },
@@ -199,6 +199,71 @@ async def execute_agendamento(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await context.bot.send_message(chat_id=chat_id, text=texto_resposta)
 
+async def execute_verificacao(update: Update, context: ContextTypes.DEFAULT_TYPE, entidades: dict):
+    """
+    Executa a lógica de verificação de disponibilidade em um horário específico.
+    """
+    chat_id = update.effective_chat.id
+    
+    try:
+        # 1. Validação e Formatação Inicial (o mesmo do agendamento)
+        if not entidades or not entidades.get('data') or not entidades.get('hora'):
+            raise ValueError("Dados de data/hora incompletos do Gemini.")
+
+        data_alvo_str = entidades["data"].strip()
+        data_alvo = datetime.datetime.strptime(data_alvo_str, '%Y-%m-%d').date()
+        hora, minuto = map(int, entidades["hora"].split(':'))
+        fuso_brasil = pytz.timezone(TIMEZONE_BRAZIL)
+
+        # 2. Formatação ISO com Fuso Horário (Assume 1 hora de duração padrão para a verificação)
+        inicio_com_fuso = fuso_brasil.localize(datetime.datetime.combine(data_alvo, datetime.time(hora, minuto)))
+        fim_com_fuso = inicio_com_fuso + datetime.timedelta(hours=1)
+        inicio_iso = inicio_com_fuso.isoformat()
+        fim_iso = fim_com_fuso.isoformat()
+
+    except Exception as e:
+        logging.error(f"Erro na conversão de dados da verificação: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="Houve um erro na conversão da data/hora. Tente um formato mais claro.")
+        return
+
+    # 3. AÇÃO: Verificar Disponibilidade
+    disponivel = verificar_disponibilidade(inicio_iso, fim_iso)
+    
+    # 4. Construir Resposta
+    data_formatada = inicio_com_fuso.strftime('%d/%m às %H:%M')
+
+    if disponivel:
+        texto_resposta = f"✅ **Confirmado!** Você está livre no dia {data_formatada}."
+    else:
+        # Sugere horários alternativos se o principal estiver ocupado
+        sugestoes = sugerir_horarios(inicio_iso, fim_iso)
+        
+        if sugestoes:
+            suggestion_map = {}
+            numbered_suggestions = []
+            for i, iso_time in enumerate(sugestoes):
+                dt_obj = datetime.datetime.fromisoformat(iso_time)
+                suggestion_map[f"{i + 1}"] = iso_time
+                numbered_suggestions.append(f"({i + 1}) às {dt_obj.strftime('%H:%M')}")
+
+            # Salva o contexto na memória
+            user_context_storage[chat_id] = {
+                'action': 'awaiting_time_selection',
+                'suggestions': suggestion_map
+            }
+
+            sugestoes_str = ' ou '.join(numbered_suggestions)
+            texto_resposta = (
+                f"❌ Ocupado. Você tem compromisso no dia {data_formatada}. "
+                f"Encontrei disponibilidade para: {sugestoes_str}."
+                f"**Responda com o número da opção desejada para agendar o evento.**"
+            )
+        else:
+            texto_resposta = (
+                f"❌ Ocupado. Você tem compromisso no dia {data_formatada} e não encontrei horários livres nas horas seguintes."
+            )
+
+    await context.bot.send_message(chat_id=chat_id, text=texto_resposta)
 
 # --- 5. Handlers do Telegram ---
 
@@ -213,22 +278,84 @@ async def iniciar_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_follow_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handler multi-turno: Processa a resposta do usuário (um número) a uma sugestão de horário.
+    Unifica a lógica de agendamento e verificação.
     """
     chat_id = update.effective_chat.id
     user_response = update.message.text.strip()
     
-    # Verifica se há um número e se existe um contexto pendente
-    if user_response.isdigit() and chat_id in user_context_storage:
-        context_data = user_context_storage[chat_id]
-        summary = context_data['summary']
+    if chat_id not in user_context_storage:
+        return False # Sem contexto, passa para o próximo handler
+        
+    context_data = user_context_storage[chat_id]
+    action = context_data.get('action')
+
+    # TRATAMENTO DE SELEÇÃO DE HORÁRIO (Estado: awaiting_time_selection)
+    if action == 'awaiting_time_selection' and user_response.isdigit():
         suggestions = context_data['suggestions']
         
         if user_response in suggestions:
             chosen_iso_time = suggestions[user_response]
             
-            # --- AÇÃO: Finalizar o Agendamento com o horário escolhido ---
+            # --- Lógica de Transição: Agendamento Original vs. Verificação ---
+            
+            # Se o RESUMO/TÍTULO já existe (veio de um comando 'agendar' original), agenda imediatamente.
+            if 'summary' in context_data:
+                summary = context_data['summary']
+                
+                chosen_start_dt = datetime.datetime.fromisoformat(chosen_iso_time)
+                chosen_end_dt = (chosen_start_dt + datetime.timedelta(hours=1)).isoformat()
+                link = criar_evento(summary, chosen_iso_time, chosen_end_dt)
+                
+                del user_context_storage[chat_id]
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ Agendamento Confirmado! O evento '{summary}' foi marcado para as {chosen_start_dt.strftime('%H:%M')}. Veja: {link}"
+                )
+                return True # Finaliza o agendamento
+                
+            # Se o RESUMO/TÍTULO NÃO existe (veio de um comando 'verificar'), pede o título.
+            else:
+                # ATUALIZA O ESTADO para AWAITING_TITLE, armazenando o horário escolhido
+                user_context_storage[chat_id] = {
+                    'action': 'awaiting_title',
+                    'chosen_time_iso': chosen_iso_time,
+                }
+                
+                # Pede o título do evento
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Ótimo! Horário selecionado. Agora, **qual será o título/resumo** deste evento?"
+                )
+                return True # Processamento multi-turno completo
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Opção inválida. Por favor, responda apenas com o número da opção (ex: '1', '2', etc.)."
+            )
+            return True
+    
+    return False # Passa para o próximo handler se não for uma seleção numérica válida
+
+
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler geral: Processa todas as mensagens de texto.
+    Usa o Gemini para decidir a intenção e encaminha a ação.
+    """
+    full_message = update.message.text
+    chat_id = update.effective_chat.id
+
+    # 1. VERIFICAÇÃO DE ESTADO MULTI-TURNO: AWAITING TITLE
+    if chat_id in user_context_storage:
+        context_data = user_context_storage[chat_id]
+        if context_data.get('action') == 'awaiting_title':
+            
+            # AÇÃO: Finalizar o Agendamento com Título Fornecido
+            summary = full_message # O texto do usuário é o novo título
+            chosen_iso_time = context_data['chosen_time_iso']
+
             chosen_start_dt = datetime.datetime.fromisoformat(chosen_iso_time)
-            # O final do evento é 1 hora depois do início escolhido
             chosen_end_dt = (chosen_start_dt + datetime.timedelta(hours=1)).isoformat()
             
             link = criar_evento(summary, chosen_iso_time, chosen_end_dt)
@@ -240,27 +367,9 @@ async def handle_follow_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text=f"✅ Agendamento Confirmado! O evento '{summary}' foi marcado para as {chosen_start_dt.strftime('%H:%M')}. Veja: {link}"
             )
-            return True # Processamento multi-turno completo
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Opção inválida. Por favor, responda apenas com o número da opção (ex: '1', '2', etc.)."
-            )
-            return True # Mensagem processada
-    
-    # Se não for uma resposta de follow-up, permite que o próximo handler processe a mensagem.
-    return False
+            return # Processamento multi-turno completo, não continua para o Gemini.
 
-
-async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler geral: Processa todas as mensagens de texto.
-    Usa o Gemini para decidir a intenção e encaminha a ação.
-    """
-    full_message = update.message.text
-    chat_id = update.effective_chat.id
-
-    # 1. RACIOCÍNIO: Decisão de Ação (Gemini)
+    # 2. RACIOCÍNIO: Decisão de Ação (Gemini)
     decision = analisar_e_decidir_acao_com_gemini(full_message)
     
     if not decision:
@@ -270,11 +379,15 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = decision.get('action')
 
     if action == 'agendar':
-        # 2. AÇÃO: Executa a lógica de AGENDAMENTO
+        # 2.1. AÇÃO: Executa a lógica de AGENDAMENTO
         await execute_agendamento(update, context, decision.get('agendamento'))
+
+    elif action == 'verificar':
+        # 2.2. AÇÃO: Executa a lógica de VERIFICAÇÃO
+        await execute_verificacao(update, context, decision.get('agendamento'))
         
     elif action == 'consultar':
-        # 2. AÇÃO: Executa a lógica de CONSULTA
+        # 2.3. AÇÃO: Executa a lógica de CONSULTA
         await execute_consulta(update, context, decision.get('consulta'))
         
     else:
