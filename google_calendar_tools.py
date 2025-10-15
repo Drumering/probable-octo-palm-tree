@@ -64,12 +64,12 @@ def format_datetime_for_query(dt_object: datetime.datetime) -> str:
     Este formato é o mais estável para os parâmetros timeMin/timeMax da API.
     """
     dt_truncated = dt_object.replace(microsecond=0)
-    # Garante o formato 'Z' (Zulu Time/UTC) sem o offset '+00:00' que causa o 400 Bad Request.
+    # Garante o formato 'Z' (Zulu Time/UTC)
     return dt_truncated.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
 
 # --- Funções de Ferramentas (Tools) do Agente ---
 
-def verificar_disponibilidade(start_time_iso: str, end_time_iso: str) -> bool:
+def check_availability(start_time_iso: str, end_time_iso: str) -> bool:
     """
     Verifica se o calendário primário está livre no intervalo especificado.
 
@@ -82,7 +82,6 @@ def verificar_disponibilidade(start_time_iso: str, end_time_iso: str) -> bool:
     """
     service = get_calendar_service()
     
-    # A consulta de eventos usa 'singleEvents=True' e 'orderBy' para ser mais robusta.
     events_result = service.events().list(
         calendarId='primary',
         timeMin=start_time_iso,
@@ -96,7 +95,7 @@ def verificar_disponibilidade(start_time_iso: str, end_time_iso: str) -> bool:
     # Se encontrou eventos, o horário está ocupado
     return not events
 
-def criar_evento(summary: str, start_time_iso: str, end_time_iso: str) -> str:
+def create_event(summary: str, start_time_iso: str, end_time_iso: str) -> str:
     """
     Cria um novo evento de 1 hora no calendário principal.
 
@@ -125,7 +124,7 @@ def criar_evento(summary: str, start_time_iso: str, end_time_iso: str) -> str:
     event = service.events().insert(calendarId='primary', body=event).execute()
     return event.get('htmlLink')
 
-def sugerir_horarios(start_time_iso: str, end_time_iso: str) -> list[str]:
+def suggest_times(start_time_iso: str, end_time_iso: str) -> list[str]:
     """
     Sugere horários subsequentes (30, 60, 90 minutos após) se o horário original estiver ocupado.
 
@@ -148,12 +147,12 @@ def sugerir_horarios(start_time_iso: str, end_time_iso: str) -> list[str]:
         new_start_time_iso = new_start_time.isoformat()
         new_end_time_iso = new_end_time.isoformat()
 
-        if verificar_disponibilidade(new_start_time_iso, new_end_time_iso):
+        if check_availability(new_start_time_iso, new_end_time_iso):
             suggestions_iso.append(new_start_time_iso)
             
     return suggestions_iso
 
-def obter_eventos_por_palavra_chave(keyword: str) -> list[dict]:
+def get_events_by_keyword(keyword: str) -> list[dict]:
     """
     Busca os 10 próximos eventos futuros por palavra-chave no título, descrição ou localização.
     
@@ -178,7 +177,7 @@ def obter_eventos_por_palavra_chave(keyword: str) -> list[dict]:
         calendarId='primary',
         timeMin=now_iso,  # Filtra apenas eventos futuros a partir de agora
         maxResults=10,    # Limita a 10 resultados
-        # singleEvents e orderBy removidos para estabilidade com o parâmetro 'q'
+        # Os parâmetros singleEvents e orderBy são removidos ao usar 'q' para estabilidade da API
         q=clean_keyword,  # O parâmetro de busca de texto livre
     ).execute()
     
@@ -192,7 +191,6 @@ def obter_eventos_por_palavra_chave(keyword: str) -> list[dict]:
     brazil_timezone = pytz.timezone(TIMEZONE_BRAZIL)
     
     for event in events:
-        # Pega o 'dateTime' para eventos com hora ou 'date' para eventos de dia inteiro
         start = event['start'].get('dateTime', event['start'].get('date'))
         dt_obj = datetime.datetime.fromisoformat(start)
         
