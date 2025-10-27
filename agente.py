@@ -289,7 +289,7 @@ async def handle_follow_up(update: Update, context: ContextTypes.DEFAULT_TYPE): 
     action = context_data.get('action')
 
     # TRATAMENTO DE SELEÇÃO DE HORÁRIO (Estado: awaiting_time_selection)
-    if action == 'awaiting_time_selection' and user_response.isdigit():
+    if 'suggestions' in context_data and user_response.isdigit():
         suggestions = context_data['suggestions']
         
         if user_response in suggestions:

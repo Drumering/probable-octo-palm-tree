@@ -164,21 +164,21 @@ def get_events_by_keyword(keyword: str) -> list[dict]:
     """
     service = get_calendar_service()
 
-    clean_keyword = normalize_keyword(keyword)
+    # clean_keyword = normalize_keyword(keyword)
 
     # 1. Define o ponto de partida (agora) em UTC
     now_dt = datetime.datetime.now(datetime.timezone.utc)
     # 2. Formata a data de forma robusta para evitar o HttpError 400
     now_iso = format_datetime_for_query(now_dt)
 
-    logging.info(f"Buscando eventos com a palavra-chave: {clean_keyword} e timeMin: {now_iso}")
+    logging.info(f"Buscando eventos com a palavra-chave: {keyword} e timeMin: {now_iso}")
     
     events_result = service.events().list(
         calendarId='primary',
         timeMin=now_iso,  # Filtra apenas eventos futuros a partir de agora
         maxResults=10,    # Limita a 10 resultados
         # Os parâmetros singleEvents e orderBy são removidos ao usar 'q' para estabilidade da API
-        q=clean_keyword,  # O parâmetro de busca de texto livre
+        q=keyword,  # O parâmetro de busca de texto livre
     ).execute()
     
     events = events_result.get('items', [])
